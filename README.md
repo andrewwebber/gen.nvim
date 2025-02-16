@@ -68,7 +68,7 @@ Example with Lazy
 },
 ```
 
-Here are all [available models](https://ollama.ai/library).
+Here are all [available models](https://ollama.com/library).
 
 Alternatively, you can call the `setup` function:
 
