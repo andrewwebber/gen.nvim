@@ -41,9 +41,9 @@ local function trim_table(tbl)
 end
 
 local default_options = {
-    model = "mistral",
-    host = "localhost",
-    port = "11434",
+    model = "gpt-4o",
+    api_key = "",
+    base_url = "https://api.openai.com",
     file = false,
     debug = false,
     body = { stream = true },
@@ -54,26 +54,32 @@ local default_options = {
     retry_map = "<c-r>",
     hidden = false,
     command = function(options)
-        return "curl -q --silent --no-buffer -X POST http://"
-            .. options.host
-            .. ":"
-            .. options.port
-            .. "/api/chat -d $body"
+        local api_key = vim.fn.shellescape(options.api_key or os.getenv("OPENAI_API_KEY") or "")
+        local base_url = options.base_url or "https://api.openai.com"
+        return string.format(
+            "curl -q --silent --no-buffer -X POST %s/v1/responses -H 'Content-Type: application/json' -H 'Authorization: Bearer %s' -d $body",
+            base_url,
+            api_key
+        )
     end,
     json_response = true,
     display_mode = "float",
     no_auto_close = false,
-    init = function()
-        pcall(io.popen, "ollama serve > /dev/null 2>&1 &")
-    end,
+    init = function() end,
     list_models = function(options)
+        local api_key = options.api_key or os.getenv("OPENAI_API_KEY") or ""
+        local base_url = options.base_url or "https://api.openai.com"
         local response = vim.fn.systemlist(
-            "curl -q --silent --no-buffer http://" .. options.host .. ":" .. options.port .. "/api/tags"
+            string.format(
+                "curl -q --silent --no-buffer %s/v1/models -H 'Authorization: Bearer %s'",
+                base_url,
+                api_key
+            )
         )
-        local list = vim.fn.json_decode(response)
+        local decoded = vim.fn.json_decode(table.concat(response, "\n"))
         local models = {}
-        for key, _ in pairs(list.models) do
-            table.insert(models, list.models[key].name)
+        for _, m in ipairs(decoded.data) do
+            table.insert(models, m.id)
         end
         table.sort(models)
         return models
@@ -393,14 +399,13 @@ M.exec = function(options)
     cmd = string.gsub(cmd, "%$model", opts.model)
     if string.find(cmd, "%$body") then
         local body = vim.tbl_extend("force", { model = opts.model, stream = true }, opts.body)
-        local messages = {}
+        local input = {}
         if globals.context then
-            messages = globals.context
+            input = globals.context
         end
-        -- Add new prompt to the context
-        table.insert(messages, { role = "user", content = prompt })
-        body.messages = messages
-        if M.model_options ~= nil then -- llamacpp server - model options: eg. temperature, top_k, top_p
+        table.insert(input, { role = "user", content = prompt })
+        body.input = input
+        if M.model_options ~= nil then -- model options: eg. temperature, top_k, top_p
             body = vim.tbl_extend("force", body, M.model_options)
         end
         if opts.model_options ~= nil then -- override model options from gen command (if exist)
@@ -436,14 +441,13 @@ M.run_command = function(cmd, opts)
         end
     end
     local partial_data = ""
+    local current_event = ""
     if opts.debug then
         print(cmd)
     end
 
     globals.job_id = vim.fn.jobstart(cmd, {
-        -- stderr_buffered = opts.debug,
         on_stdout = function(_, data, _)
-            -- window was closed, so cancel the job
             if not globals.float_win or not vim.api.nvim_win_is_valid(globals.float_win) then
                 if globals.job_id then
                     vim.fn.jobstop(globals.job_id)
@@ -458,23 +462,15 @@ M.run_command = function(cmd, opts)
                 vim.print("Response data: ", data)
             end
             for _, line in ipairs(data) do
-                partial_data = partial_data .. line
-                if line:sub(-1) == "}" then
-                    partial_data = partial_data .. "\n"
+                if line:match("^event: ") then
+                    current_event = line:sub(8)
+                elseif line:match("^data: ") then
+                    local json_str = line:sub(7)
+                    Process_response(json_str, current_event, opts.json_response)
+                    current_event = ""
+                elseif line == "" then
+                    current_event = ""
                 end
-            end
-
-            local lines = vim.split(partial_data, "\n", { trimempty = true })
-
-            partial_data = table.remove(lines) or ""
-
-            for _, line in ipairs(lines) do
-                Process_response(line, globals.job_id, opts.json_response)
-            end
-
-            if partial_data:sub(-1) == "}" then
-                Process_response(partial_data, globals.job_id, opts.json_response)
-                partial_data = ""
             end
         end,
         on_stderr = function(_, data, _)
@@ -609,79 +605,83 @@ end, {
     end,
 })
 
-function Process_response(str, json_response)
+function Process_response(str, event_type, json_response)
     if string.len(str) == 0 then
         return
     end
     local text
 
     if json_response then
-        -- llamacpp response string -- 'data: {"content": "hello", .... }' -- remove 'data: ' prefix, before json_decode
-        if string.sub(str, 1, 6) == "data: " then
-            str = string.gsub(str, "data: ", "", 1)
-        end
         local success, result = pcall(function()
             return vim.fn.json_decode(str)
         end)
 
         if success then
-            if result.message and result.message.content then -- ollama chat endpoint
-                local content = result.message.content
-                text = content
-
+            if event_type == "response.text.delta" then
+                text = result.delta or ""
                 globals.context = globals.context or {}
                 globals.context_buffer = globals.context_buffer or ""
-                globals.context_buffer = globals.context_buffer .. content
-
-                -- When the message sequence is complete, add it to the context
-                if result.done then
+                globals.context_buffer = globals.context_buffer .. text
+            elseif event_type == "response.completed" then
+                local resp = result.response
+                if resp and resp.output then
+                    local full_text = ""
+                    for _, item in ipairs(resp.output) do
+                        if item.type == "message" and item.content then
+                            for _, part in ipairs(item.content) do
+                                if part.type == "output_text" then
+                                    full_text = full_text .. part.text
+                                end
+                            end
+                        end
+                    end
+                    globals.context_buffer = full_text
                     table.insert(globals.context, {
                         role = "assistant",
-                        content = globals.context_buffer,
+                        content = full_text,
                     })
-                    -- Clear the buffer as we're done with this sequence of messages
                     globals.context_buffer = ""
                 end
-            elseif result.choices then -- groq chat endpoint
-                local choice = result.choices[1]
-                local content = tostring(choice.delta.content)
-                text = content
-
-                if content ~= nil then
-                    globals.context = globals.context or {}
-                    globals.context_buffer = globals.context_buffer or ""
-                    globals.context_buffer = globals.context_buffer .. content
-                end
-
-                -- When the message sequence is complete, add it to the context
-                if choice.finish_reason == "stop" then
+            elseif result.type == "response.text.delta" then
+                text = result.delta or ""
+                globals.context = globals.context or {}
+                globals.context_buffer = globals.context_buffer or ""
+                globals.context_buffer = globals.context_buffer .. text
+            elseif result.type == "response.completed" then
+                local resp = result.response
+                if resp and resp.output then
+                    local full_text = ""
+                    for _, item in ipairs(resp.output) do
+                        if item.type == "message" and item.content then
+                            for _, part in ipairs(item.content) do
+                                if part.type == "output_text" then
+                                    full_text = full_text .. part.text
+                                end
+                            end
+                        end
+                    end
+                    globals.context_buffer = full_text
                     table.insert(globals.context, {
                         role = "assistant",
-                        content = globals.context_buffer,
+                        content = full_text,
                     })
-                    -- Clear the buffer as we're done with this sequence of messages
                     globals.context_buffer = ""
                 end
-            elseif result.content then -- llamacpp version
-                text = result.content
-                if result.content then
-                    globals.context = result.content
-                end
-            elseif result.response then -- ollama generate endpoint
-                text = result.response
-                if result.context then
-                    globals.context = result.context
-                end
+            else
+                write_to_buffer({ "", "====== ERROR ====", "Unrecognized event: " .. tostring(event_type), "-------------", "" })
+                vim.fn.jobstop(globals.job_id)
+                return
             end
         else
             write_to_buffer({ "", "====== ERROR ====", str, "-------------", "" })
             vim.fn.jobstop(globals.job_id)
+            return
         end
     else
         text = str
     end
 
-    if text == nil then
+    if text == nil or text == "" then
         return
     end
 
